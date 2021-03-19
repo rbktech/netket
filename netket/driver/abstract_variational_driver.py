@@ -276,8 +276,9 @@ class AbstractVariationalDriver(abc.ABC):
 
                 if len(loggers) > 0:
                     self._log_additional_data(log_data, step)
+                    self._log_data = log_data
                     for logger in loggers:
-                        logger(self.step_count, log_data, self.state)
+                        logger(self.step_value, log_data, self.state)
 
                 # Update the progress bar
                 pbar.update(self.step_value - old_step_value)

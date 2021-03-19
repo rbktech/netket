@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from functools import singledispatch
-import typing
+from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import scipy.integrate as _scint
@@ -23,13 +23,13 @@ import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_map
 
+import netket.jax as nkjax
+
 from netket.operator import AbstractOperator
 from netket.drivers.abstract_variational_driver import AbstractVariationalDriver
 from netket.drivers.vmc_common import info
-
+from netket.variational import VariationalState, MCState, MCMixedState
 from netket.stats import Stats
-import netket.jax as nkjax
-from netket import variational
 
 
 #  self is driver
@@ -39,7 +39,7 @@ def dwdt(state, self, t, w):
 
 
 @dwdt.register
-def dwdt_mcstate(state: variational.MCState, self, t, w):
+def dwdt_mcstate(state: MCState, self, t, w):
     state.reset()
 
     self._loss_stats, self._loss_grad = state.expect_and_grad(self.generator)
@@ -53,7 +53,7 @@ def dwdt_mcstate(state: variational.MCState, self, t, w):
 
 
 @dwdt.register
-def dwdt_mcmixedstate(state: variational.MCMixedState, self, t, w):
+def dwdt_mcmixedstate(state: MCMixedState, self, t, w):
     state.reset()
 
     self._loss_stats, self._loss_grad = state.expect_and_grad(self.generator)
@@ -67,31 +67,34 @@ def dwdt_mcmixedstate(state: variational.MCMixedState, self, t, w):
 
 class TimeEvolution(AbstractVariationalDriver):
     """
-    Energy minimization using Variational Monte Carlo (VMC).
-
-    Args:
-        operator: the generator of the dynamics (hamiltonian, lindbladian...)
-        variational_state: The variational state
-        sr: The SR Matrix inversion settings
-        sr_restart:
-        tspan: Specify this as (t0, tend) or the two separately
-        t0: initial time
-        tend: end time. stop integrating at this time
+    Variational Time evolution using the time-dependent Variational Monte Carlo (t-VMC)
     """
 
     def __init__(
         self,
-        operator,
+        operator: AbstractOperator,
         *args,
-        variational_state=None,
+        variational_state: VariationalState = None,
         sr=None,
         solver=None,
         sr_restart: bool = False,
-        tspan=None,
-        t0=None,
-        tend=None,
+        tspan: Optional[Tuple[float, float]] = None,
+        t0: Optional[float] = None,
+        tend: Optional[float] = None,
         **kwargs,
     ):
+        """
+        Construct the time evolution driver
+
+        Args:
+            operator: the generator of the dynamics (hamiltonian, lindbladian...)
+            variational_state: The variational state
+            sr: The SR Matrix inversion settings
+            sr_restart:
+            tspan: Specify this as (t0, tend) or the two separately
+            t0: initial time
+            tend: end time. stop integrating at this time
+        """
         if variational_state is None:
             variational_state = MCState(*args, **kwargs)
 
@@ -231,7 +234,6 @@ class TimeEvolution(AbstractVariationalDriver):
 
     def _log_additional_data(self, obs, step):
         obs["t"] = self.t
-        self._log_additional_data(obs, step)
 
     @property
     def _default_step_size(self):
@@ -299,7 +301,7 @@ class TimeEvolution(AbstractVariationalDriver):
 
     @parameters_vec.setter
     def parameters_vec(self, y):
-        if isinstance(y, variational.VariationalState):
+        if isinstance(y, VariationalState):
             y, _ = nkjax.tree_ravel(y.parameters)
 
         self._integrator.y = y

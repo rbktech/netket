@@ -15,7 +15,7 @@
 import numpy as np
 import scipy.integrate as integrate
 
-from ._scipy_integrators import EulerSolver
+from .scipy_integrators import EulerSolver
 
 
 # List of integrated methods

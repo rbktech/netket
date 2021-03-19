@@ -42,6 +42,12 @@ solver = nk.dynamics.Euler(dt=0.01)
 
 te = nk.TimeEvolution(ha, variational_state=vs, sr=sr, solver=solver)
 
+Sx = sum([nk.operator.spin.sigmax(hi, i) for i in range(L)])
+
+log = nk.logging.JsonLog("test")
+
+out = te.run(1.0, out=log, show_progress=False, obs={"SX": Sx}, step_size=0.1)[0]
+
 # Variational monte carlo driver
 # gs = nk.VMC(ha, op, sa, ma, n_samples=1000, n_discard=50)
 
