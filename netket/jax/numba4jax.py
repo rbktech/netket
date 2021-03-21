@@ -93,6 +93,13 @@ import numpy as np
 
 from netket import config
 
+# necessary for numba interop
+import ctypes
+from cffi import FFI
+from numba import cuda as ncuda
+
+#
+
 
 def _xla_shape_to_abstract(xla_shape):
     return jax.abstract_arrays.ShapedArray(
@@ -240,27 +247,282 @@ def _xla_translation_cpu(numba_fn, abstract_eval_fn, xla_builder, *args):
     )
 
 
+try:
+    _libcuda = ncuda.driver.find_driver()
+
+    from .numba4jax_utils import find_path_of_symbol_in_library
+
+    libcuda_path = find_path_of_symbol_in_library(_libcuda.cuMemcpy)
+    numba_cffi_loaded = True
+except:
+    numba_cffi_loaded = False
+
+if numba_cffi_loaded:
+
+    # functions needed
+    ffi = FFI()
+    ffi.cdef("int cuMemcpy(void* dst, void* src, unsigned int len, int type);")
+    ffi.cdef(
+        "int cuMemcpyAsync(void* dst, void* src, unsigned int len, int type, void* stream);"
+    )
+    ffi.cdef("int cuStreamSynchronize(void* stream);")
+
+    ffi.cdef("int cudaMallocHost(void** ptr, size_t size);")
+    ffi.cdef("int cudaFreeHost(void* ptr);")
+
+    # load libraray
+    #  could usaa ncuda.driver.find_library()
+    libcuda = ffi.dlopen(numba_cffi_loaded)
+    cuMemcpy = libcuda.cuMemcpy
+    cuMemcpyAsync = libcuda.cuMemcpyAsync
+    cuStreamSynchronize = libcuda.cuStreamSynchronize
+
+    memcpyHostToHost = nb_types.int32(0)
+    memcpyHostToDevice = nb_types.int32(1)
+    memcpyDeviceToHost = nb_types.int32(2)
+    memcpyDeviceToDevice = nb_types.int32(3)
+
+
 def _xla_translation_gpu(numba_fn, abstract_eval_fn, xla_builder, *args):
+
+    if not config.FLAGS["NETKET_EXPERIMENTAL"]:
+        raise RuntimeError(
+            dedent(
+                """
+                           The numba4jax module, which allows calling numba
+                           functions from jax-jitted functions, is experimentally 
+                           supported on the GPU.
+ 
+                           set NETKET_EXPERIMENTAL=1 to use it.
+                           """
+            )
+        )
+
+    if not numba_cffi_loaded:
+        # throw the correct numba error
+        ncuda.driver.find_driver()
 
     if config.FLAGS["NETKET_DEBUG"]:
         print("Encoding the GPU variant of numba4jax function")
 
-    raise RuntimeError(
-        dedent(
-            """
-                       The numba4jax module, which allows calling numba
-                       functions from jax-jitted functions, is not 
-                       supported on the GPU.
+    input_shapes = [xla_builder.get_shape(arg) for arg in args]
+    input_dtypes = tuple(shape.element_type() for shape in input_shapes)
+    input_dimensions = tuple(shape.dimensions() for shape in input_shapes)
+    input_byte_size = tuple(
+        np.prod(shape) * dtype.itemsize
+        for (shape, dtype) in zip(input_dimensions, input_dtypes)
+    )
 
-                       Most probably you were using a Sampler Transition
-                       rule that only works on CPU. Use the version of this
-                       sampler instead.
+    input_i = tuple(i for i in range(len(input_dimensions)))
+    n_in = len(input_dimensions)
 
-                       If you are a hardcore developer and are not scared
-                       of CUDA, C and LLVM, get in touch with us to make
-                       it work.
-                       """
-        )
+    # TODO(josipd): Check that the input layout is the numpy default.
+    output_abstract_arrays = abstract_eval_fn(
+        *[_xla_shape_to_abstract(shape) for shape in input_shapes]
+    )
+    output_shapes = tuple(array.shape for array in output_abstract_arrays)
+
+    output_ndims = tuple(array.ndim for array in output_abstract_arrays)
+    output_ndims_offsets = tuple(np.cumsum(np.concatenate([[0], output_ndims])))
+    output_dtypes = tuple(array.dtype for array in output_abstract_arrays)
+    output_byte_size = tuple(
+        np.prod(shape) * dtype.itemsize
+        for (shape, dtype) in zip(output_shapes, output_dtypes)
+    )
+
+    layout_for_shape = lambda shape: range(len(shape) - 1, -1, -1)
+    output_layouts = map(layout_for_shape, output_shapes)
+    xla_output_shapes = [
+        xla_client.Shape.array_shape(*arg)
+        for arg in zip(output_dtypes, output_shapes, output_layouts)
+    ]
+    xla_output_shape = xla_client.Shape.tuple_shape(xla_output_shapes)
+
+    output_i = tuple(i for i in range(len(output_shapes)))
+
+    n_out = len(output_shapes)
+
+    xla_call_sig = nb_types.void(
+        nb_types.voidptr,  # cudaStream_t* stream
+        nb_types.CPointer(nb_types.voidptr),  # void** buffers
+        nb_types.voidptr,  # const char* opaque
+        nb_types.uint64,  # size_t opaque_len
+    )
+
+    print(f"With N_in={n_in} and n_out={n_out}")
+
+    @numba.cfunc(xla_call_sig)
+    def xla_custom_call_target(stream, inout_gpu_ptrs, opaque, opaque_len):
+        # manually unroll input and output args because numba is
+        # relatively dummb and cannot always infer getitem on inhomogeneous tuples
+
+        # allocate output cpu bufferess
+        if n_out == 1:
+            args_out = (np.empty(output_shapes[0], dtype=output_dtypes[0]),)
+        elif n_out == 2:
+            args_out = (
+                np.empty(output_shapes[0], dtype=output_dtypes[0]),
+                np.empty(output_shapes[1], dtype=output_dtypes[1]),
+            )
+        elif n_out == 3:
+            args_out = (
+                np.empty(output_shapes[0], dtype=output_dtypes[0]),
+                np.empty(output_shapes[1], dtype=output_dtypes[1]),
+                np.empty(output_shapes[2], dtype=output_dtypes[2]),
+            )
+        elif n_out == 4:
+            args_out = (
+                np.empty(output_shapes[0], dtype=output_dtypes[0]),
+                np.empty(output_shapes[1], dtype=output_dtypes[1]),
+                np.empty(output_shapes[2], dtype=output_dtypes[2]),
+                np.empty(output_shapes[3], dtype=output_dtypes[3]),
+            )
+
+        # allocate input cpu buffers and
+        if n_in == 1:
+            args_in = (np.empty(input_dimensions[0], dtype=input_dtypes[0]),)
+            cuMemcpyAsync(
+                args_in[0].ctypes.data,
+                inout_gpu_ptrs[0],
+                input_byte_size[0],
+                memcpyDeviceToHost,
+                stream,
+            )
+        elif n_in == 2:
+            args_in = (
+                np.empty(input_dimensions[0], dtype=input_dtypes[0]),
+                np.empty(input_dimensions[1], dtype=input_dtypes[1]),
+            )
+            cuMemcpyAsync(
+                args_in[0].ctypes.data,
+                inout_gpu_ptrs[0],
+                input_byte_size[0],
+                memcpyDeviceToHost,
+                stream,
+            )
+            cuMemcpyAsync(
+                args_in[1].ctypes.data,
+                inout_gpu_ptrs[1],
+                input_byte_size[1],
+                memcpyDeviceToHost,
+                stream,
+            )
+        elif n_in == 3:
+            args_in = (
+                np.empty(input_dimensions[0], dtype=input_dtypes[0]),
+                np.empty(input_dimensions[1], dtype=input_dtypes[1]),
+                np.empty(input_dimensions[2], dtype=input_dtypes[2]),
+            )
+            cuMemcpyAsync(
+                args_in[0].ctypes.data,
+                inout_gpu_ptrs[0],
+                input_byte_size[0],
+                memcpyDeviceToHost,
+                stream,
+            )
+            cuMemcpyAsync(
+                args_in[1].ctypes.data,
+                inout_gpu_ptrs[1],
+                input_byte_size[1],
+                memcpyDeviceToHost,
+                stream,
+            )
+            cuMemcpyAsync(
+                args_in[2].ctypes.data,
+                inout_gpu_ptrs[2],
+                input_byte_size[2],
+                memcpyDeviceToHost,
+                stream,
+            )
+        CcudaStreamSynchronize(stream)
+        numba_fn(args_out + args_in)
+
+        if n_out == 1:
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 0],
+                args_out[0].ctypes.data,
+                output_byte_size[0],
+                memcpyHostToDevice,
+                stream,
+            )
+        elif n_out == 2:
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 0],
+                args_out[0].ctypes.data,
+                output_byte_size[0],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 1],
+                args_out[1].ctypes.data,
+                output_byte_size[1],
+                memcpyHostToDevice,
+                stream,
+            )
+        elif n_out == 3:
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 0],
+                args_out[0].ctypes.data,
+                output_byte_size[0],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 1],
+                args_out[1].ctypes.data,
+                output_byte_size[1],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 2],
+                args_out[2].ctypes.data,
+                output_byte_size[2],
+                memcpyHostToDevice,
+                stream,
+            )
+        elif n_out == 4:
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 0],
+                args_out[0].ctypes.data,
+                output_byte_size[0],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 1],
+                args_out[1].ctypes.data,
+                output_byte_size[1],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 2],
+                args_out[2].ctypes.data,
+                output_byte_size[2],
+                memcpyHostToDevice,
+                stream,
+            )
+            cuMemcpyAsync(
+                inout_gpu_ptrs[n_in + 3],
+                args_out[3].ctypes.data,
+                output_byte_size[3],
+                memcpyHostToDevice,
+                stream,
+            )
+
+        CcudaStreamSynchronize(stream)
+
+    target_name = xla_custom_call_target.native_name.encode("ascii")
+    capsule = _create_xla_target_capsule(xla_custom_call_target.address)
+    xla_client.register_custom_call_target(target_name, capsule, "gpu")
+    return xla_client.ops.CustomCallWithLayout(
+        xla_builder,
+        target_name,
+        operands=args,
+        shape_with_layout=xla_output_shape,
+        operand_shapes_with_layout=input_shapes,
     )
 
 
