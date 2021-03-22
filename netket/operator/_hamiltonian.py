@@ -146,7 +146,7 @@ class Ising(SpecialHamiltonian):
 
         self._h = dtype(h)
         self._J = dtype(J)
-        self._edges = np.asarray(list(graph.edges()))
+        self._edges = np.asarray(list(graph.edges()), dtype=np.intp)
 
         self._dtype = dtype
 
