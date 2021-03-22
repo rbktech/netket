@@ -22,6 +22,7 @@ from ._hamiltonian import Ising, Heisenberg, BoseHubbard
 
 from ._abstract_super_operator import AbstractSuperOperator
 from ._local_liouvillian import LocalLiouvillian
+from ._imag_time_generator import ImagTimeGenerator
 
 from . import spin, boson
 
