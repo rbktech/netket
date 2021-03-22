@@ -18,6 +18,7 @@ from numpy.typing import DTypeLike, ArrayLike
 
 import numpy as np
 from numba import jit
+from numba.experimental import jitclass
 
 import jax
 import jax.numpy as jnp
@@ -195,6 +196,7 @@ class LocalOperator(AbstractOperator):
         """
         super().__init__(hilbert)
         self._constant = constant
+        self._impl = None
 
         # check if passing a single operator or a list of operators
         if isinstance(acting_on, numbers.Number):
@@ -214,7 +216,7 @@ class LocalOperator(AbstractOperator):
             for op in operators[1:]:
                 np.promote_types(dtype, op.dtype)
 
-        self._dtype = dtype
+        self._dtype = np.empty((), dtype=dtype).dtype
         self._init_zero()
 
         self.mel_cutoff = 1.0e-6
@@ -222,6 +224,27 @@ class LocalOperator(AbstractOperator):
         for op, act in zip(operators, acting_on):
             if len(act) > 0:
                 self._add_operator(op, act)
+
+    @property
+    def implementation(self):
+        if self._impl is None:
+            from ._local_operator_impl import get_jitted_implementation
+
+            constructor = get_jitted_implementation(self.dtype)
+
+            self._impl = constructor(
+                self._acting_on,
+                self._acting_size,
+                self._diag_mels,
+                self._mels,
+                self._x_prime,
+                self._n_conns,
+                self._local_states,
+                self._basis,
+                self._constant,
+            )
+
+        return self._impl
 
     @property
     def operators(self) -> List[np.ndarray]:
@@ -513,6 +536,8 @@ class LocalOperator(AbstractOperator):
             self.__add_new_operator__(operator, acting_on)
 
     def __add_new_operator__(self, operator: np.ndarray, acting_on: np.ndarray):
+        self._impl = None
+
         # Else, we must add a completely new operator
         self._n_operators += 1
         self._operators.append(operator)
@@ -783,147 +808,16 @@ class LocalOperator(AbstractOperator):
 
         """
 
-        return self._get_conn_flattened_kernel(
-            x,
-            sections,
-            self._local_states,
-            self._basis,
-            self._constant,
-            self._diag_mels,
-            self._n_conns,
-            self._mels,
-            self._x_prime,
-            self._acting_on,
-            self._acting_size,
-            pad,
-        )
+        return self.implementation.get_conn_flattened(x, sections, pad)
 
     def _get_conn_flattened_closure(self):
-        _local_states = self._local_states
-        _basis = self._basis
-        _constant = self._constant
-        _diag_mels = self._diag_mels
-        _n_conns = self._n_conns
-        _mels = self._mels
-        _x_prime = self._x_prime
-        _acting_on = self._acting_on
-        _acting_size = self._acting_size
-        fun = self._get_conn_flattened_kernel
 
-        def gccf_fun(x, sections):
-            return fun(
-                x,
-                sections,
-                _local_states,
-                _basis,
-                _constant,
-                _diag_mels,
-                _n_conns,
-                _mels,
-                _x_prime,
-                _acting_on,
-                _acting_size,
-            )
+        O = self.implementation
 
-        return jit(nopython=True)(gccf_fun)
+        def _fun(x, sections, pad=False):
+            return O.get_conn_flattened(x, sections, pad)
 
-    @staticmethod
-    @jit(nopython=True)
-    def _get_conn_flattened_kernel(
-        x,
-        sections,
-        local_states,
-        basis,
-        constant,
-        diag_mels,
-        n_conns,
-        all_mels,
-        all_x_prime,
-        acting_on,
-        acting_size,
-        pad=False,
-    ):
-        batch_size = x.shape[0]
-        n_sites = x.shape[1]
-        dtype = all_mels.dtype
-
-        assert sections.shape[0] == batch_size
-
-        n_operators = n_conns.shape[0]
-        xs_n = np.empty((batch_size, n_operators), dtype=np.intp)
-
-        tot_conn = 0
-        max_conn = 0
-
-        for b in range(batch_size):
-            # diagonal element
-            conn_b = 1
-
-            # counting the off-diagonal elements
-            for i in range(n_operators):
-                acting_size_i = acting_size[i]
-
-                xs_n[b, i] = 0
-                x_b = x[b]
-                x_i = x_b[acting_on[i, :acting_size_i]]
-                for k in range(acting_size_i):
-                    xs_n[b, i] += (
-                        np.searchsorted(
-                            local_states[i, acting_size_i - k - 1],
-                            x_i[acting_size_i - k - 1],
-                        )
-                        * basis[i, k]
-                    )
-
-                conn_b += n_conns[i, xs_n[b, i]]
-
-            tot_conn += conn_b
-            sections[b] = tot_conn
-
-            if pad:
-                max_conn = max(conn_b, max_conn)
-
-        if pad:
-            tot_conn = batch_size * max_conn
-
-        x_prime = np.empty((tot_conn, n_sites), dtype=x.dtype)
-        mels = np.empty(tot_conn, dtype=dtype)
-
-        c = 0
-        for b in range(batch_size):
-            c_diag = c
-            mels[c_diag] = constant
-            x_batch = x[b]
-            x_prime[c_diag] = np.copy(x_batch)
-            c += 1
-            for i in range(n_operators):
-
-                # Diagonal part
-                mels[c_diag] += diag_mels[i, xs_n[b, i]]
-                n_conn_i = n_conns[i, xs_n[b, i]]
-
-                if n_conn_i > 0:
-                    sites = acting_on[i]
-                    acting_size_i = acting_size[i]
-
-                    for cc in range(n_conn_i):
-                        mels[c + cc] = all_mels[i, xs_n[b, i], cc]
-                        x_prime[c + cc] = np.copy(x_batch)
-
-                        for k in range(acting_size_i):
-                            x_prime[c + cc, sites[k]] = all_x_prime[
-                                i, xs_n[b, i], cc, k
-                            ]
-                    c += n_conn_i
-
-            if pad:
-                delta_conn = max_conn - (c - c_diag)
-                mels[c : c + delta_conn].fill(0)
-                x_prime[c : c + delta_conn, :] = np.copy(x_batch)
-                c += delta_conn
-                sections[b] = c
-
-        return x_prime, mels
+        return jit(nopython=True)(_fun)
 
     def get_conn_filtered(self, x, sections, filters):
         r"""Finds the connected elements of the Operator using only a subset of operators. Starting
@@ -948,104 +842,7 @@ class LocalOperator(AbstractOperator):
             array: An array containing the matrix elements :math:`O(x,x')` associated to each x'.
 
         """
-
-        return self._get_conn_filtered_kernel(
-            x,
-            sections,
-            self._local_states,
-            self._basis,
-            self._constant,
-            self._diag_mels,
-            self._n_conns,
-            self._mels,
-            self._x_prime,
-            self._acting_on,
-            self._acting_size,
-            filters,
-        )
-
-    @staticmethod
-    @jit(nopython=True)
-    def _get_conn_filtered_kernel(
-        x,
-        sections,
-        local_states,
-        basis,
-        constant,
-        diag_mels,
-        n_conns,
-        all_mels,
-        all_x_prime,
-        acting_on,
-        acting_size,
-        filters,
-    ):
-
-        batch_size = x.shape[0]
-        n_sites = x.shape[1]
-        dtype = all_mels.dtype
-
-        assert filters.shape[0] == batch_size and sections.shape[0] == batch_size
-
-        n_operators = n_conns.shape[0]
-        xs_n = np.empty((batch_size, n_operators), dtype=np.intp)
-
-        tot_conn = 0
-
-        for b in range(batch_size):
-            # diagonal element
-            tot_conn += 1
-
-            # counting the off-diagonal elements
-            i = filters[b]
-
-            assert i < n_operators and i >= 0
-            acting_size_i = acting_size[i]
-
-            xs_n[b, i] = 0
-            x_b = x[b]
-            x_i = x_b[acting_on[i, :acting_size_i]]
-            for k in range(acting_size_i):
-                xs_n[b, i] += (
-                    np.searchsorted(
-                        local_states[i, acting_size_i - k - 1],
-                        x_i[acting_size_i - k - 1],
-                    )
-                    * basis[i, k]
-                )
-
-            tot_conn += n_conns[i, xs_n[b, i]]
-            sections[b] = tot_conn
-
-        x_prime = np.empty((tot_conn, n_sites))
-        mels = np.empty(tot_conn, dtype=dtype)
-
-        c = 0
-        for b in range(batch_size):
-            c_diag = c
-            mels[c_diag] = constant
-            x_batch = x[b]
-            x_prime[c_diag] = np.copy(x_batch)
-            c += 1
-
-            i = filters[b]
-            # Diagonal part
-            mels[c_diag] += diag_mels[i, xs_n[b, i]]
-            n_conn_i = n_conns[i, xs_n[b, i]]
-
-            if n_conn_i > 0:
-                sites = acting_on[i]
-                acting_size_i = acting_size[i]
-
-                for cc in range(n_conn_i):
-                    mels[c + cc] = all_mels[i, xs_n[b, i], cc]
-                    x_prime[c + cc] = np.copy(x_batch)
-
-                    for k in range(acting_size_i):
-                        x_prime[c + cc, sites[k]] = all_x_prime[i, xs_n[b, i], cc, k]
-                c += n_conn_i
-
-        return x_prime, mels
+        return self.implementation.get_conn_filtered(x, sections, filters)
 
     def __repr__(self):
         ao = self.acting_on
