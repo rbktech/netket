@@ -26,8 +26,8 @@ from jax.tree_util import tree_map
 import netket.jax as nkjax
 
 from netket.operator import AbstractOperator
-from netket.drivers.abstract_variational_driver import AbstractVariationalDriver
-from netket.drivers.vmc_common import info
+from netket.driver.abstract_variational_driver import AbstractVariationalDriver
+from netket.driver.vmc_common import info
 from netket.variational import VariationalState, MCState, MCMixedState
 from netket.stats import Stats
 
@@ -105,7 +105,7 @@ class TimeEvolution(AbstractVariationalDriver):
             raise TypeError(
                 f"""the variational_state has hilbert space {variational_state.hilbert} 
                                 (this is normally defined by the hilbert space in the sampler), but
-                                the hamiltonian has hilbert space {hamiltonian.hilbert}. 
+                                the operator has hilbert space {operator.hilbert}. 
                                 The two should match."""
             )
 
